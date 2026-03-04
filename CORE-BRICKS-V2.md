@@ -212,6 +212,70 @@ async def execute(call: dict, ctx: dict, registry: dict) -> dict:
 
 ---
 
+## TurnEngine (The Glue)
+
+Not a brick — it is the single orchestration path that consumes all bricks.
+
+```python
+class TurnEngine:
+    def __init__(self, store, provider, tools, handle_command, build_messages, on_progress=None):
+        self.store = store
+        self.provider = provider
+        self.tools = tools
+        self.handle_command = handle_command
+        self.build_messages = build_messages
+        self.on_progress = on_progress or (lambda event: None)
+
+    async def run(self, request: dict, policies: dict = None) -> dict:
+        cmd = self.handle_command(request, self.store)
+        if cmd is not None:
+            await self.store.commit(request["session_key"], cmd.get("trace", []))
+            return cmd
+
+        ctx = self.store.load_context(request["session_key"], policies["memory"]["window"])
+        messages = self.build_messages(ctx, request)
+        registry = self.tools["registry"]
+        schemas = self.tools["schemas"](registry, policies.get("tool", {}))
+        tool_ctx = {"session_key": request["session_key"], "permissions": policies.get("tool", {})}
+        trace = []
+
+        for _ in range(policies.get("max_iterations", 25)):
+            llm = await self.provider(messages, schemas, policies.get("model", {}))
+            trace.append({"role": "assistant", "content": llm["text"], "tool_calls": llm["tool_calls"]})
+
+            if not llm["tool_calls"]:
+                break
+
+            for call in llm["tool_calls"]:
+                result = await self.tools["execute"](call, tool_ctx, registry)
+                trace.append({"role": "tool", "call": call, "content": result})
+            messages = self.build_messages(ctx, request) + trace
+            await self.on_progress({"text": llm["text"], "tool_calls": llm["tool_calls"]})
+
+        final = llm["text"] or "[no response]"
+        await self.store.commit(request["session_key"], trace)
+        return {"emit": True, "content": final, "outbound": {
+            "channel": request["metadata"].get("channel"),
+            "chat_id": request["metadata"].get("chat_id"),
+            "content": final,
+            "metadata": request.get("metadata", {}),
+        }}
+```
+
+Everything that is not iteration logic is an injected brick:
+
+| Concern | Brick called |
+|---|---|
+| Slash commands | `self.handle_command(request, store)` |
+| History + memory | `self.store.load_context(...)` / `self.store.commit(...)` |
+| Prompt assembly | `self.build_messages(ctx, request)` |
+| LLM call | `self.provider(messages, schemas, settings)` |
+| Tool filtering | `self.tools["schemas"](registry, policy)` |
+| Tool execution | `self.tools["execute"](call, ctx, registry)` |
+| Streaming | `self.on_progress(event)` |
+
+---
+
 ## Injected Callbacks (Not Full Bricks)
 
 These are `async (data) -> None` signatures passed into runner or engine. They don't carry enough internal logic to be bricks.
